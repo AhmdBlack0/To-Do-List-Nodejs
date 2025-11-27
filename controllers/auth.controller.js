@@ -1,304 +1,346 @@
 import User from "../models/user.model.js";
 import bcrypt from "bcryptjs";
-import { v2 as cloudinary } from "cloudinary";
 import { generateTokenAndSetCookie } from "../lib/generateTokenAndSetCookie.js";
+import nodemailer from "nodemailer";
+import { createHash, randomInt } from "crypto";
+import dotenv from "dotenv";
+import { asyncHandler } from "../middlewares/asyncHandler.js";
 
-export const register = async (req, res) => {
-  try {
-    const { username, password, email } = req.body;
-    let { profilePicture } = req.body;
+dotenv.config();
 
-    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ error: "Invalid email format" });
-    }
+const transporter = nodemailer.createTransport({
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+  tls: { rejectUnauthorized: false },
+});
 
-    const existingUser = await User.findOne({ username });
-    if (existingUser) {
-      return res.status(400).json({ error: "Username is already taken" });
-    }
+const generateVerificationCode = () => randomInt(100000, 1000000).toString();
 
-    const existingEmail = await User.findOne({ email });
-    if (existingEmail) {
-      return res.status(400).json({ error: "Email is already taken" });
-    }
+export const register = asyncHandler(async (req, res) => {
+  const { name, email, password, role } = req.body;
 
-    if (password.length < 6) {
-      return res
-        .status(400)
-        .json({ error: "Password must be at least 6 characters long" });
-    }
-
-    if (profilePicture) {
-      try {
-        const uploadedResponse = await cloudinary.uploader.upload(
-          profilePicture
-        );
-        profilePicture = uploadedResponse.secure_url;
-      } catch (uploadError) {
-        return res
-          .status(400)
-          .json({ error: "Failed to upload profile picture" });
-      }
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    const newUser = new User({
-      username,
-      email,
-      password: hashedPassword,
-      profilePicture: profilePicture || "",
-    });
-
-    await newUser.save();
-
-    generateTokenAndSetCookie(newUser._id, res);
-
-    res.status(201).json({
-      message: "User registered successfully",
-      data: {
-        id: newUser._id,
-        username: newUser.username,
-        email: newUser.email,
-        role: newUser.role,
-        profilePicture: newUser.profilePicture,
-        createdAt: newUser.createdAt,
-      },
-    });
-  } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ error: "Internal server error" });
+  let user = await User.findOne({ email });
+  if (user) {
+    const err = new Error("User already exists");
+    err.statusCode = 400;
+    throw err;
   }
-};
 
-export const login = async (req, res) => {
-  try {
-    const { username, password } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
 
-    if (!username || !password) {
-      return res
-        .status(400)
-        .json({ error: "Username and password are required" });
-    }
+  const verificationCode = generateVerificationCode();
+  const verificationCodeExpires = Date.now() + 600000;
 
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(400).json({ error: "User does not exist" });
-    }
+  user = await User.create({
+    name,
+    email,
+    password: hashedPassword,
+    verificationCode,
+    verificationCodeExpires,
+    isVerified: false,
+  });
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(400).json({ error: "Password Wrong" });
-    }
+  await transporter.sendMail({
+    from: `"My App" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: "Verify your email",
+    html: `
+      <h2>Hello ${user.name}</h2>
+      <p>Your verification code:</p>
+      <h1 style="color:#007bff">${verificationCode}</h1>
+      <p>This code expires in 10 minutes.</p>
+    `,
+  });
 
-    generateTokenAndSetCookie(user._id, res);
+  res.cookie("verifyEmail", user.email, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+    maxAge: 10 * 60 * 1000,
+  });
 
-    res.status(200).json({
-      message: "Login successful",
-      data: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        profilePicture: user.profilePicture,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      },
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  res.status(201).json({
+    success: true,
+    message: "Verification code sent to your email.",
+  });
+});
+
+export const verifyEmail = asyncHandler(async (req, res) => {
+  const { code } = req.body;
+  const email = req.cookies.verifyEmail;
+
+  if (!email) {
+    const err = new Error("Verification expired. Register again.");
+    err.statusCode = 400;
+    throw err;
   }
-};
 
-export const getMe = async (req, res) => {
-  try {
-    const user = await User.findById(req.userId).select("-password");
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
+  const user = await User.findOne({
+    email,
+    verificationCode: code,
+    verificationCodeExpires: { $gt: Date.now() },
+  });
 
-    res.status(200).json({
-      message: "User retrieved successfully",
-      data: user,
-    });
-  } catch (error) {
-    console.error("Get user error:", error);
-    res.status(500).json({ error: "Internal server error" });
+  if (!user) {
+    const err = new Error("Invalid or expired verification code");
+    err.statusCode = 400;
+    throw err;
   }
-};
 
-export const logout = async (req, res) => {
-  try {
-    res.cookie("jwt", "", {
-      maxAge: 0,
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
-    });
-    res.status(200).json({ message: "Logged out successfully" });
-  } catch (error) {
-    console.error("Logout error:", error);
-    res.status(500).json({ error: "Internal server error" });
+  user.isVerified = true;
+  user.verificationCode = undefined;
+  user.verificationCodeExpires = undefined;
+  await user.save();
+
+  res.clearCookie("verifyEmail");
+
+  generateTokenAndSetCookie(user, res);
+
+  res.json({ success: true, message: "Email verified successfully!" });
+});
+
+export const resendVerification = asyncHandler(async (req, res) => {
+  const email = req.cookies.verifyEmail;
+
+  if (!email) {
+    const err = new Error("Verification session expired. Register again.");
+    err.statusCode = 400;
+    throw err;
   }
-};
 
-export const updateProfile = async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { username, email } = req.body;
-    let { profilePicture } = req.body;
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    if (username && username !== user.username) {
-      const existingUser = await User.findOne({ username });
-      if (existingUser) {
-        return res.status(400).json({ error: "Username is already taken" });
-      }
-    }
-
-    if (email && email !== user.email) {
-      const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-      if (!emailRegex.test(email)) {
-        return res.status(400).json({ error: "Invalid email format" });
-      }
-
-      const existingEmail = await User.findOne({ email });
-      if (existingEmail) {
-        return res.status(400).json({ error: "Email is already taken" });
-      }
-    }
-
-    if (profilePicture) {
-      try {
-        if (user.profilePicture) {
-          const publicId = user.profilePicture.split("/").pop().split(".")[0];
-          await cloudinary.uploader.destroy(publicId);
-        }
-
-        const uploadedResponse = await cloudinary.uploader.upload(
-          profilePicture
-        );
-        profilePicture = uploadedResponse.secure_url;
-      } catch (uploadError) {
-        return res
-          .status(400)
-          .json({ error: "Failed to upload profile picture" });
-      }
-    }
-
-    if (username) user.username = username;
-    if (email) user.email = email;
-    if (profilePicture) user.profilePicture = profilePicture;
-
-    await user.save();
-
-    res.status(200).json({
-      message: "Profile updated successfully",
-      data: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        profilePicture: user.profilePicture,
-        updatedAt: user.updatedAt,
-      },
-    });
-  } catch (error) {
-    console.error("Update profile error:", error);
-    res.status(500).json({ error: "Internal server error" });
+  const user = await User.findOne({ email });
+  if (!user) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
   }
-};
 
-export const changePassword = async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { currentPassword, newPassword } = req.body;
-
-    if (!currentPassword || !newPassword) {
-      return res
-        .status(400)
-        .json({ error: "Current password and new password are required" });
-    }
-
-    if (newPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: "New password must be at least 6 characters long" });
-    }
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const isCurrentPasswordValid = await bcrypt.compare(
-      currentPassword,
-      user.password
-    );
-    if (!isCurrentPasswordValid) {
-      return res.status(400).json({ error: "Current password is incorrect" });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedNewPassword = await bcrypt.hash(newPassword, salt);
-
-    user.password = hashedNewPassword;
-    await user.save();
-
-    res.status(200).json({ message: "Password changed successfully" });
-  } catch (error) {
-    console.error("Change password error:", error);
-    res.status(500).json({ error: "Internal server error" });
+  if (user.isVerified) {
+    const err = new Error("Email already verified");
+    err.statusCode = 400;
+    throw err;
   }
-};
 
-export const deleteAccount = async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { password } = req.body;
+  const verificationCode = generateVerificationCode();
 
-    if (!password) {
-      return res
-        .status(400)
-        .json({ error: "Password is required to delete account" });
-    }
+  user.verificationCode = verificationCode;
+  user.verificationCodeExpires = Date.now() + 10 * 60 * 1000;
+  await user.save();
 
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
+  await transporter.sendMail({
+    from: `"My App" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: "Resend verification code",
+    html: `
+      <h2>Hello ${user.name}</h2>
+      <p>Your new code:</p>
+      <h1 style="color:#007bff">${verificationCode}</h1>
+    `,
+  });
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(400).json({ error: "Password is incorrect" });
-    }
+  res.cookie("verifyEmail", email, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+    maxAge: 10 * 60 * 1000,
+  });
 
-    if (user.profilePicture) {
-      try {
-        const publicId = user.profilePicture.split("/").pop().split(".")[0];
-        await cloudinary.uploader.destroy(publicId);
-      } catch (error) {
-        console.error("Error deleting profile picture:", error);
-      }
-    }
+  res.json({ success: true, message: "Verification code resent" });
+});
 
-    await User.findByIdAndDelete(userId);
+export const login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email }).select("+password +isVerified");
 
-    res.cookie("jwt", "", {
-      maxAge: 0,
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
-    });
-
-    res.status(200).json({ message: "Account deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    const err = new Error("Invalid credentials");
+    err.statusCode = 400;
+    throw err;
   }
-};
+
+  if (!user.isVerified) {
+    const err = new Error("Please verify your email first");
+    err.statusCode = 401;
+    throw err;
+  }
+
+  generateTokenAndSetCookie(user, res);
+
+  res.json({ success: true, message: "Logged in successfully" });
+});
+
+export const getMe = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.userId).select(
+    "-password -__v -verificationCode -verificationCodeExpires -resetPasswordToken -resetPasswordExpires"
+  );
+
+  if (!user) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  res.json({ success: true, user });
+});
+
+export const updateProfile = asyncHandler(async (req, res) => {
+  const { name } = req.body;
+
+  const user = await User.findByIdAndUpdate(
+    req.userId,
+    { name },
+    { new: true }
+  ).select("-password -__v");
+
+  res.json({ success: true, message: "Profile updated", user });
+});
+
+export const changePassword = asyncHandler(async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+
+  const user = await User.findById(req.userId).select("+password");
+
+  if (!user || !(await bcrypt.compare(currentPassword, user.password))) {
+    const err = new Error("Current password incorrect");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  user.password = await bcrypt.hash(newPassword, 10);
+  await user.save();
+
+  res.json({ success: true, message: "Password changed successfully" });
+});
+
+export const deleteAccount = asyncHandler(async (req, res) => {
+  const { password } = req.body;
+
+  const user = await User.findById(req.userId).select("+password");
+  if (!user) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (!(await bcrypt.compare(password, user.password))) {
+    const err = new Error("Password is incorrect");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await user.deleteOne();
+
+  res.clearCookie("jwt");
+
+  res.json({ success: true, message: "Account deleted" });
+});
+
+export const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    const err = new Error("Email is required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const user = await User.findOne({ email });
+  if (!user) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  // Generate 6-digit code
+  const resetCode = randomInt(100000, 1000000).toString();
+
+  const hashedCode = createHash("sha256").update(resetCode).digest("hex");
+
+  user.resetPasswordCode = hashedCode;
+  user.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // 10 min
+  await user.save();
+
+  // Set cookie storing the email
+  res.cookie("resetEmail", email, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+    maxAge: 10 * 60 * 1000,
+  });
+
+  await transporter.sendMail({
+    from: `"My App" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: "Reset Password",
+    html: `<h2>Password Reset Code</h2><h1>${resetCode}</h1>`,
+  });
+
+  res.json({
+    success: true,
+    message: "Reset code sent to email",
+  });
+});
+
+export const resetForgetPassword = asyncHandler(async (req, res) => {
+  const email = req.cookies.resetEmail;
+  const { code, newPassword } = req.body;
+
+  if (!email) {
+    const err = new Error("Email cookie missing");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!code || !newPassword) {
+    const err = new Error("Code and new password are required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Trim whitespace from code
+  const cleanedCode = code.toString().trim();
+
+  const hashedCode = createHash("sha256").update(cleanedCode).digest("hex");
+
+  const user = await User.findOne({
+    email,
+    resetPasswordCode: hashedCode,
+    resetPasswordExpires: { $gt: Date.now() },
+  });
+
+  if (!user) {
+    const err = new Error("Invalid or expired code");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  user.password = await bcrypt.hash(newPassword, 10);
+  user.resetPasswordCode = undefined;
+  user.resetPasswordExpires = undefined;
+
+  await user.save();
+
+  // Clear cookie
+  res.clearCookie("resetEmail");
+
+  res.json({
+    success: true,
+    message: "Password reset successfully. You can now log in.",
+  });
+});
+
+export const logout = asyncHandler(async (req, res) => {
+  res.cookie("jwt", "", {
+    httpOnly: true,
+    expires: new Date(0),
+    sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+    secure: process.env.NODE_ENV === "production",
+  });
+
+  res.json({ success: true, message: "Logged out successfully" });
+});

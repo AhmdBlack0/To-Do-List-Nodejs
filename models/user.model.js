@@ -2,9 +2,8 @@ import mongoose from "mongoose";
 
 const userSchema = new mongoose.Schema(
   {
-    username: {
+    name: {
       type: String,
-      required: [true, "Username is required"],
     },
     email: {
       type: String,
@@ -19,9 +18,21 @@ const userSchema = new mongoose.Schema(
       enum: ["admin", "user"],
       default: "user",
     },
-    profilePicture: {
+    isVerified: {
+      type: Boolean,
+      default: false,
+    },
+    verificationCode: {
       type: String,
-      default: "",
+    },
+    resetPasswordCode: {
+      type: String,
+    },
+    verificationCodeExpires: {
+      type: Date,
+    },
+    resetPasswordCodeExpires: {
+      type: Date,
     },
   },
   {
