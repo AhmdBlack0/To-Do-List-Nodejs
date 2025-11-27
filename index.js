@@ -7,6 +7,7 @@ import todoRoutes from "./routes/todo.routes.js";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import { v2 as cloudinary } from "cloudinary";
+import { errorHandler } from "./middlewares/errorHandler.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -28,6 +29,7 @@ app.use(cookieParser());
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/todos", todoRoutes);
+app.use(errorHandler);
 
 const startServer = async () => {
   try {

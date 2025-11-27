@@ -40,6 +40,7 @@ export const register = asyncHandler(async (req, res) => {
     name,
     email,
     password: hashedPassword,
+    role,
     verificationCode,
     verificationCodeExpires,
     isVerified: false,
