@@ -1,5 +1,5 @@
 import express from "express";
-import protectedRoute from "../middlewares/protectedRoute.js";
+import { verifyToken } from "../middlewares/verifyToken.js";
 import {
   createTodo,
   getTodos,
@@ -10,7 +10,7 @@ import {
 } from "../controllers/todo.controller.js";
 const router = express.Router();
 
-router.use(protectedRoute);
+router.use(verifyToken);
 
 router.get("/", getTodos);
 router.post("/", createTodo);
